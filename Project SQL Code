@@ -1,0 +1,319 @@
+-- ========================================================
+-- 1. DIMENSION TABLES (Create these first)
+-- ========================================================
+
+-- Holds the calendar year tracking for census data
+CREATE TABLE Years (
+    year_key INT PRIMARY KEY,
+    census_year INT NOT NULL
+);
+
+-- Holds geographical data for plotting on Power BI maps
+CREATE TABLE Metros (
+    metro_key INT PRIMARY KEY,
+    metro_id VARCHAR(10),        -- FIPS/CBSA code
+    metro_name VARCHAR(150),     -- e.g., "Oklahoma City, OK"
+    state_code CHAR(2),          -- e.g., "OK"
+    latitude DECIMAL(9,6),       -- Map plotting
+    longitude DECIMAL(9,6)       -- Map plotting
+);
+
+-- Holds categorized age ranges for stacked bar charts
+CREATE TABLE AgeGroups (
+    age_group_key INT PRIMARY KEY,
+    age_group VARCHAR(50)        -- e.g., "18-34"
+);
+
+-- Holds demographic slices for legends and category splits
+CREATE TABLE Demographics (
+    demographic_key INT PRIMARY KEY,
+    race_ethnicity VARCHAR(100), -- e.g., "Hispanic"
+    gender VARCHAR(20)           -- e.g., "Female"
+);
+
+
+-- ========================================================
+-- 2. FACT TABLES (Create these last)
+-- ========================================================
+
+-- Granular table for stacked bar charts and trend lines
+CREATE TABLE Populations (
+    year_key INT REFERENCES Years(year_key),
+    metro_key INT REFERENCES Metros(metro_key),
+    age_group_key INT REFERENCES AgeGroups(age_group_key),
+    demographic_key INT REFERENCES Demographics(demographic_key),
+    population_count INT NOT NULL,
+    PRIMARY KEY (year_key, metro_key, age_group_key, demographic_key)
+);
+
+-- High-level summary table for scatter plots (Median Age vs. Growth %)
+CREATE TABLE MetroMetrics (
+    year_key INT REFERENCES Years(year_key),
+    metro_key INT REFERENCES Metros(metro_key),
+    total_population INT,
+    median_age DECIMAL(4,1),     -- Pre-calculated non-additive metric
+    growth_count INT,
+    growth_percentage DECIMAL(5,2),
+    PRIMARY KEY (year_key, metro_key)
+);
+
+
+
+
+
+-- ============================================================================
+-- 1. BRONZE LAYER (Raw Tables - Staging No Constraints)
+-- ============================================================================
+
+CREATE TABLE bronze_cbsa_char (
+    SUMLEV INT, CBSA INT, MDIV VARCHAR(50), NAME VARCHAR(255), LSAD VARCHAR(100), YEAR INT, AGEGRP INT,
+    TOT_POP INT, TOT_MALE INT, TOT_FEMALE INT, WA_MALE INT, WA_FEMALE INT, BA_MALE INT, BA_FEMALE INT,
+    IA_MALE INT, IA_FEMALE INT, AA_MALE INT, AA_FEMALE INT, NA_MALE INT, NA_FEMALE INT, TOM_MALE INT, TOM_FEMALE INT
+);
+
+CREATE TABLE bronze_cbsa_age (
+    SUMLEV INT, CBSA INT, MDIV VARCHAR(50), NAME VARCHAR(255), LSAD VARCHAR(100), YEAR INT,
+    POPESTIMATE INT, POPEST_MALE INT, POPEST_FEM INT, MEDIAN_AGE_TOT DECIMAL(4,1)
+);
+
+CREATE TABLE bronze_csa_char (
+    SUMLEV INT, CSA INT, NAME VARCHAR(255), LSAD VARCHAR(100), YEAR INT, AGEGRP INT,
+    TOT_POP INT, TOT_MALE INT, TOT_FEMALE INT
+);
+-- ============================================================================
+-- 2. SILVER LAYER (Cleaned, Enriched Operational Views/Tables)
+-- ============================================================================
+
+CREATE TABLE silver_clean_demographics (
+    CBSA INT, metro_name VARCHAR(150), state_code CHAR(2), YEAR INT, AGEGRP INT,
+    TOT_POP INT, TOT_MALE INT, TOT_FEMALE INT
+);
+
+CREATE TABLE silver_clean_metrics (
+    CBSA INT, metro_name VARCHAR(150), YEAR INT, POPESTIMATE INT,
+    PriorYearPop INT, growth_count INT, growth_percentage DECIMAL(5,2), median_age DECIMAL(4,1)
+);
+
+-- ============================================================================
+-- 3. GOLD LAYER (Production Dimensional Star Schema)
+-- ============================================================================
+
+CREATE TABLE gold_Years (
+    year_key INT PRIMARY KEY,
+    census_year INT NOT NULL
+);
+
+CREATE TABLE gold_Metros (
+    metro_key INT PRIMARY KEY,
+    metro_id VARCHAR(10), metro_name VARCHAR(150), state_code CHAR(2),
+    latitude DECIMAL(9,6) NULL, longitude DECIMAL(9,6) NULL
+);
+
+CREATE TABLE gold_AgeGroups (
+    age_group_key INT PRIMARY KEY,
+    age_group VARCHAR(50)
+);
+
+CREATE TABLE gold_Demographics (
+    demographic_key INT PRIMARY KEY, race_ethnicity VARCHAR(100), gender VARCHAR(20)
+);
+
+CREATE TABLE gold_Populations (
+    year_key INT FOREIGN KEY REFERENCES gold_Years(year_key),
+    metro_key INT FOREIGN KEY REFERENCES gold_Metros(metro_key),
+    age_group_key INT FOREIGN KEY REFERENCES gold_AgeGroups(age_group_key),
+    demographic_key INT FOREIGN KEY REFERENCES gold_Demographics(demographic_key),
+    population_count INT NOT NULL,
+    PRIMARY KEY (year_key, metro_key, age_group_key, demographic_key)
+);
+
+CREATE TABLE gold_MetroMetrics (
+    year_key INT FOREIGN KEY REFERENCES gold_Years(year_key),
+    metro_key INT FOREIGN KEY REFERENCES gold_Metros(metro_key),
+    total_population INT, median_age DECIMAL(4,1) NULL, growth_count INT, growth_percentage DECIMAL(5,2),
+    PRIMARY KEY (year_key, metro_key)
+);
+
+-- Expand growth percentage to hold up to 12 digits total, 4 past the decimal
+ALTER TABLE silver_clean_metrics ALTER COLUMN growth_percentage DECIMAL(12,4);
+ALTER TABLE gold_MetroMetrics ALTER COLUMN growth_percentage DECIMAL(12,4);
+
+-- TABLE CLEANUP   
+
+TRUNCATE TABLE gold_Populations;
+TRUNCATE TABLE gold_MetroMetrics;
+
+DELETE FROM gold_Years;
+DELETE FROM gold_Metros;
+DELETE FROM gold_AgeGroups;
+DELETE FROM gold_Demographics;
+
+
+
+-- verify foreign keys
+select * from gold_Populations;
+select * from gold_MetroMetrics;
+
+
+-- star schema verification
+
+-- Check if any populations point to a non-existent metro area
+SELECT COUNT(*) 
+FROM dbo.gold_Populations p
+LEFT JOIN dbo.gold_Metros m ON p.metro_key = m.metro_key
+WHERE m.metro_key IS NULL;
+
+-- Verify that each metro area only appears once in the dimension
+SELECT metro_key, COUNT(*)
+FROM dbo.gold_Metros
+GROUP BY metro_key
+HAVING COUNT(*) > 1;
+
+-- Verify that there is exactly one row per year/metro/age/demographic bucket
+SELECT year_key, metro_key, age_group_key, demographic_key, COUNT(*)
+FROM dbo.gold_Populations
+GROUP BY year_key, metro_key, age_group_key, demographic_key
+HAVING COUNT(*) > 1;
+
+-- 1. Check Raw Bronze Data
+SELECT SUM(CAST(TOT_POP AS BIGINT)) FROM dbo.bronze_cbsa_char WHERE AGEGRP != 0;
+
+-- 2. Check Cleaned Silver Data
+SELECT SUM(CAST(TOT_POP AS BIGINT)) FROM dbo.silver_clean_demographics;
+
+-- 3. Check Final Gold Fact Table Data
+
+-- fix the data in the gold fact table
+SELECT TOP 10 year_key, metro_key, age_group_key, COUNT(*) as row_multiplier, SUM(population_count) as calculated_pop
+FROM dbo.gold_Populations
+GROUP BY year_key, metro_key, age_group_key
+ORDER BY row_multiplier DESC;
+
+-- Break down the sums by individual years to see if they look normal
+SELECT year_key, SUM(CAST(population_count AS BIGINT)) as yearly_total
+FROM dbo.gold_Populations
+GROUP BY year_key
+ORDER BY year_key;
+
+-- 1. Targeted Bronze Check
+SELECT SUM(CAST(TOT_POP AS BIGINT)) FROM dbo.bronze_cbsa_char WHERE AGEGRP != 0 AND YEAR = 3;
+
+-- 2. Targeted Silver Check
+SELECT SUM(CAST(TOT_POP AS BIGINT)) FROM dbo.silver_clean_demographics WHERE YEAR = 3;
+
+-- 3. Targeted Gold Check
+SELECT SUM(CAST(population_count AS BIGINT)) FROM dbo.gold_Populations WHERE year_key = 3;
+
+-- 1. Corrected Silver Sum (Looking ONLY at true Metro/Micro areas, filtering out CSA codes)
+SELECT SUM(CAST(TOT_POP AS BIGINT)) 
+FROM dbo.silver_clean_demographics 
+WHERE YEAR = 3 AND AGEGRP != 0 AND CBSA IS NOT NULL;
+
+-- 2. Your Gold Sum for the Exact Same Year
+SELECT SUM(CAST(population_count AS BIGINT)) 
+FROM dbo.gold_Populations 
+WHERE year_key = 3;
+
+
+-- gold data verification
+SELECT TOP 100
+    -- Time Dimension Context
+    y.census_year AS [Year],
+    
+    -- Geographic Dimension Context
+    m.metro_name AS [Metro Area],
+    m.state_code AS [State],
+    
+    -- Demographic Dimension Context
+    ag.age_group AS [Age Bracket],
+    d.race_ethnicity AS [Demographic Group],
+    
+    -- Fact Table Comparison
+    p.population_count AS [Granular Age Population],
+    mm.total_population AS [Total Metro Population (Verify Aggregate)],
+    mm.median_age AS [Metro Median Age]
+
+FROM dbo.gold_Populations p
+-- Validate links to all Dimension Tables
+INNER JOIN dbo.gold_Years y ON p.year_key = y.year_key
+INNER JOIN dbo.gold_Metros m ON p.metro_key = m.metro_key
+INNER JOIN dbo.gold_AgeGroups ag ON p.age_group_key = ag.age_group_key
+INNER JOIN dbo.gold_Demographics d ON p.demographic_key = d.demographic_key
+-- Validate link to the parallel Metro Metrics Fact Table
+INNER JOIN dbo.gold_MetroMetrics mm ON p.year_key = mm.year_key 
+                                   AND p.metro_key = mm.metro_key
+ORDER BY 
+    y.census_year ASC, 
+    m.metro_name ASC, 
+    ag.age_group_key ASC;
+
+-- test query to get city with the highest population
+SELECT TOP 1
+    m.metro_name AS [Metro Area],
+    m.state_code AS [State],
+    y.census_year AS [Data Year],
+    mm.total_population AS [Highest Population]
+FROM dbo.gold_MetroMetrics mm
+INNER JOIN dbo.gold_Metros m ON mm.metro_key = m.metro_key
+INNER JOIN dbo.gold_Years y ON mm.year_key = y.year_key
+WHERE mm.year_key = (SELECT MAX(year_key) FROM dbo.gold_MetroMetrics)
+ORDER BY mm.total_population DESC;
+
+
+SELECT TOP 1 * FROM dbo.Years;
+
+
+SELECT TOP 1 * FROM dbo.Metros;
+
+
+SELECT TOP 1 * FROM dbo.AgeGroups;
+
+-- Run these one at a time to see the headers
+SELECT TOP 1 * FROM dbo.Years;
+SELECT TOP 1 * FROM dbo.gold_Metros;
+SELECT TOP 1 * FROM dbo.gold_AgeGroups;
+SELECT TOP 1 * FROM dbo.gold_Demographics;
+
+SELECT 
+    TABLE_NAME, 
+    COLUMN_NAME, 
+    DATA_TYPE
+FROM INFORMATION_SCHEMA.COLUMNS
+WHERE TABLE_NAME LIKE 'gold_%'
+ORDER BY TABLE_NAME, ORDINAL_POSITION;
+
+-- data was updated so here's ab updated view 
+CREATE OR ALTER VIEW v_PowerBI_Census_Analytics AS
+SELECT 
+    -- 1. Time Dimensions
+    y.year_key,
+    y.report_year AS census_year,
+
+    -- 2. Geographic Dimensions
+    m.metro_key,
+    m.cbsa_code AS metro_id,
+    m.metro_name,
+    m.state_abbreviation AS state_code,
+
+    -- 3. Demographic Dimensions
+    ag.age_group_key,
+    ag.age_group_label AS age_group,
+    d.demographic_group AS race_ethnicity,
+    d.gender,
+
+    -- 4. Population Facts
+    p.population_count AS age_group_population,
+
+    -- 5. Metro-Level Aggregate Facts
+    mm.total_population AS total_metro_population,
+    mm.median_age AS metro_median_age,
+    mm.growth_count AS metro_growth_count,
+    mm.growth_percentage AS metro_growth_percentage
+
+FROM dbo.gold_Populations p
+INNER JOIN dbo.gold_Years y ON p.year_key = y.year_key
+INNER JOIN dbo.gold_Metros m ON p.metro_key = m.metro_key
+INNER JOIN dbo.gold_AgeGroups ag ON p.age_group_key = ag.age_group_key
+INNER JOIN dbo.gold_Demographics d ON p.demographic_key = d.demographic_key
+INNER JOIN dbo.MetroMetrics mm ON p.year_key = mm.year_key 
+                               AND p.metro_key = mm.metro_key;
